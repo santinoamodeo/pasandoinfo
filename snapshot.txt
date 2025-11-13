@@ -30,7 +30,7 @@ SEL = (os.getenv("DASHBOARD_SELECTOR") or "").strip()   # vacío => full page
 OUT = os.getenv("OUTPUT_PATH", "/var/www/growatt/latest.png")
 VW = int(os.getenv("VIEWPORT_W", "1920"))
 VH = int(os.getenv("VIEWPORT_H", "1080"))
-EXTRA_WAIT = int(os.getenv("EXTRA_WAIT", "5"))
+EXTRA_WAIT = int(os.getenv("EXTRA_WAIT", "8"))
 
 COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.pkl")
 
@@ -54,7 +54,7 @@ def build_driver():
     return webdriver.Chrome(service=service, options=opts)
 
 # =======================
-# Utilidades
+# Utilidades de cookies/FS
 # =======================
 def ensure_dir(file_path: str):
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
@@ -81,6 +81,9 @@ def save_cookies(driver):
     except Exception:
         pass
 
+# =======================
+# Detección/login
+# =======================
 def is_login_page(driver):
     # Detecta login por IDs reales del formulario
     try:
@@ -112,44 +115,94 @@ def do_login(driver):
         # fallback: ENTER
         pwd.send_keys(Keys.ENTER)
 
-    # Esperar a que deje el login
+    # Esperar a que deje /login
     wait.until(lambda d: "/login" not in (d.current_url or ""))
 
-    # Forzar la URL final correcta y darle tiempo a renderizar
-    driver.get(DASHBOARD_URL)
-    WebDriverWait(driver, 30).until(lambda d: "/index" in (d.current_url or ""))
-    time.sleep(1.5)
+    # Si no nos dejó en /index, forzar
+    if "/index" not in (driver.current_url or ""):
+        driver.get(DASHBOARD_URL)
 
     save_cookies(driver)
 
-def _wait_invisibility_of_any(driver, selectors, timeout=30):
-    """Espera a que cualquiera de los posibles 'loaders' desaparezca."""
-    for by, sel in selectors:
+# =======================
+# Esperas robustas de SPA
+# =======================
+def wait_dom_ready(driver, timeout=30):
+    WebDriverWait(driver, timeout).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+
+def click_dashboard_tab(driver):
+    """
+    Click en el tile/botón Dashboard si existe.
+    """
+    candidates = [
+        (By.XPATH, "//*[normalize-space(text())='Dashboard']"),
+        (By.CSS_SELECTOR, ".dashboard, .menu-dashboard, .home-dashboard")
+    ]
+    for by, sel in candidates:
         try:
-            WebDriverWait(driver, timeout).until(
-                EC.invisibility_of_element_located((by, sel))
-            )
+            el = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((by, sel)))
+            el.click()
+            time.sleep(0.5)
             return True
-        except TimeoutException:
-            pass
+        except Exception:
+            continue
     return False
 
-def wait_dashboard_ready(driver, timeout=35):
+def wait_loader_gone_js(driver, timeout=60):
     """
-    Intenta detectar que el dashboard dejó de estar 'Loading'.
-    Ajustá/añadí selectores si ves otros spinners.
+    Espera a que no haya overlays/spinners visibles (via JS).
+    Retorna True si el loader desaparece antes del timeout.
     """
-    loader_candidates = [
-        (By.XPATH, "//*[contains(., 'Loading')]"),
-        (By.CSS_SELECTOR, ".el-loading-mask"),
-        (By.CSS_SELECTOR, ".el-loading-spinner"),
-        (By.CSS_SELECTOR, ".loading"),
-        (By.CSS_SELECTOR, ".is-loading"),
-        (By.CSS_SELECTOR, ".layui-layer-loading"),
-    ]
-    time.sleep(1.5)  # breve espera para que aparezca el loader si va a aparecer
-    _wait_invisibility_of_any(driver, loader_candidates, timeout=timeout)
+    end = time.time() + timeout
+    js = """
+      const sel = ['.el-loading-mask','.el-loading-spinner','.layui-layer-loading','.loading','.is-loading'];
+      function anyVisible() {
+        for (const s of sel) {
+          const el = document.querySelector(s);
+          if (!el) continue;
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          const visible = style.visibility !== 'hidden' &&
+                          style.display !== 'none' &&
+                          rect.width > 1 && rect.height > 1 && rect.bottom > 0 && rect.right > 0;
+          if (visible) return true;
+        }
+        const txt = document.body.innerText || '';
+        if (txt.includes('Loading')) return true;
+        return false;
+      }
+      return anyVisible();
+    """
+    while time.time() < end:
+        try:
+            if not driver.execute_script(js):
+                return True
+        except Exception:
+            pass
+        time.sleep(1.0)
+    return False
 
+def wait_dashboard_ready(driver, hard_timeout=60, extra_wait=5):
+    """DOM listo → (opcional) click Dashboard → esperar loaders → refresco de rescate → espera extra."""
+    wait_dom_ready(driver, timeout=min(30, hard_timeout))
+    click_dashboard_tab(driver)  # no pasa nada si no encuentra
+
+    ok = wait_loader_gone_js(driver, timeout=hard_timeout)
+    if not ok:
+        # Refresco de rescate una vez
+        driver.execute_script("location.reload()")
+        wait_dom_ready(driver, timeout=min(30, hard_timeout))
+        click_dashboard_tab(driver)
+        wait_loader_gone_js(driver, timeout=hard_timeout)
+
+    if extra_wait > 0:
+        time.sleep(extra_wait)
+
+# =======================
+# Screenshots
+# =======================
 def fullpage_screenshot(driver, out_path):
     # Captura “full page” (con stitching si hace falta)
     total_h = driver.execute_script(
@@ -199,12 +252,8 @@ def main():
         if is_login_page(driver):
             do_login(driver)
 
-        # Esperar a que pinte el dashboard y desaparezcan loaders
-        wait_dashboard_ready(driver, timeout=40)
-
-        # Espera extra configurable
-        if EXTRA_WAIT > 0:
-            time.sleep(EXTRA_WAIT)
+        # Esperar dashboard listo (con refresh de rescate y extra wait)
+        wait_dashboard_ready(driver, hard_timeout=60, extra_wait=EXTRA_WAIT)
 
         # Screenshot (full page o por selector)
         if SEL:
