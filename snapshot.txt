@@ -1,110 +1,132 @@
-import os, time, pickle
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os, time, pickle, sys
 from dotenv import load_dotenv
 from PIL import Image
+
 from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# --- Env ---
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
-USER = os.getenv("GROWATT_USER")
-PASS = os.getenv("GROWATT_PASS")
+# >>> Chromium (APT)
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+
+# =======================
+# Cargar variables .env
+# =======================
+ENV_PATH = os.path.join(os.path.dirname(__file__), "..", ".env")
+if not load_dotenv(ENV_PATH):
+    print("Aviso: no se pudo cargar .env; usaré variables de entorno si existen.", file=sys.stderr)
+
+USER = os.getenv("GROWATT_USER", "")
+PASS = os.getenv("GROWATT_PASS", "")
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://server.growatt.com/newPortal/#/index")
-SEL = os.getenv("DASHBOARD_SELECTOR", "").strip()
+SEL = (os.getenv("DASHBOARD_SELECTOR") or "").strip()   # vacío => full page
 OUT = os.getenv("OUTPUT_PATH", "/var/www/growatt/latest.png")
 VW = int(os.getenv("VIEWPORT_W", "1920"))
 VH = int(os.getenv("VIEWPORT_H", "1080"))
 
 COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.pkl")
 
+# =======================
+# Driver Chromium (APT)
+# =======================
 def build_driver():
+    """
+    Usa el binario de Chromium y ChromeDriver instalados por APT:
+      - /usr/bin/chromium-browser
+      - /usr/lib/chromium-browser/chromedriver
+    Si tus rutas difieren, cámbialas aquí.
+    """
     opts = Options()
+    opts.binary_location = "/usr/bin/chromium-browser"     # binario APT, NO el snap
     opts.add_argument("--headless")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument(f"--window-size={VW},{VH}")
-    # Rutas típicas en Ubuntu 18.04; ChromeDriver lo encuentra solo si está en PATH
-    return webdriver.Chrome(options=opts)
 
-def load_cookies(driver, url):
+    service = Service("/usr/lib/chromium-browser/chromedriver")
+    return webdriver.Chrome(service=service, options=opts)
+
+# =======================
+# Utilidades
+# =======================
+def ensure_dir(file_path: str):
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+def load_cookies(driver, url_base="https://server.growatt.com/"):
     if os.path.exists(COOKIES_PATH):
-        driver.get("https://server.growatt.com/")
-        with open(COOKIES_PATH, "rb") as f:
-            cookies = pickle.load(f)
-        for c in cookies:
-            # evita errores por dominios
-            c.pop('sameSite', None)
-            try:
-                driver.add_cookie(c)
-            except Exception:
-                pass
-        driver.get(url)
+        driver.get(url_base)
+        try:
+            with open(COOKIES_PATH, "rb") as f:
+                cookies = pickle.load(f)
+            for c in cookies:
+                c.pop("sameSite", None)  # evita errores en algunas versiones
+                try:
+                    driver.add_cookie(c)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 def save_cookies(driver):
-    with open(COOKIES_PATH, "wb") as f:
-        pickle.dump(driver.get_cookies(), f)
-
-def is_login_page(driver):
-    u = driver.current_url.lower()
-    if "login" in u: 
-        return True
-    # Heurística: si aparece input de usuario
     try:
-        driver.find_element(By.CSS_SELECTOR, 'input[name="account"], input[name="username"]')
-        return True
-    except NoSuchElementException:
-        return False
-
-def do_login(driver):
-    driver.get("https://server.growatt.com/")
-    wait = WebDriverWait(driver, 20)
-    user = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[name="account"], input[name="username"]')))
-    # contraseña (intenta varios)
-    try:
-        pwd = driver.find_element(By.CSS_SELECTOR, 'input[name="password"]')
-    except NoSuchElementException:
-        pwd = driver.find_element(By.CSS_SELECTOR, 'input[type="password"]')
-    user.clear(); user.send_keys(USER)
-    pwd.clear();  pwd.send_keys(PASS)
-
-    # Botón: intenta variantes comunes
-    for sel in ['button[type="submit"]','.login-btn','.el-button--primary','.btn-login']:
-        try:
-            driver.find_element(By.CSS_SELECTOR, sel).click()
-            break
-        except NoSuchElementException:
-            continue
-
-    # A veces no navega; ve directo al dashboard
-    try:
-        driver.get(DASHBOARD_URL)
+        with open(COOKIES_PATH, "wb") as f:
+            pickle.dump(driver.get_cookies(), f)
     except Exception:
         pass
 
-    # Guarda cookies para próximas corridas
-    time.sleep(2)
+def is_login_page(driver):
+    # Detecta login por IDs que viste (#val_loginAccount / #val_loginPwd)
+    try:
+        driver.find_element(By.CSS_SELECTOR, "#val_loginAccount, #val_loginPwd")
+        return True
+    except Exception:
+        return "login" in (driver.current_url or "").lower()
+
+def do_login(driver):
+    # Ir directo al login “clásico” y llenar los campos por ID
+    driver.get("https://server.growatt.com/login")
+    wait = WebDriverWait(driver, 30)
+
+    user = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#val_loginAccount")))
+    pwd  = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#val_loginPwd")))
+
+    user.clear(); user.send_keys(USER)
+    pwd.clear();  pwd.send_keys(PASS)
+
+    # Enviar el formulario: ENTER en el campo contraseña
+    pwd.send_keys(Keys.ENTER)
+
+    # Algunas SPA no navegan; forzamos ir al dashboard y esperamos
+    time.sleep(2.5)
+    driver.get(DASHBOARD_URL)
+    time.sleep(2.0)
+
     save_cookies(driver)
 
 def fullpage_screenshot(driver, out_path):
-    # Para full page, scrollea y arma un PNG único
-    total_height = driver.execute_script("return document.body.scrollHeight")
-    # Si el dashboard es SPA y cabe en viewport, basta con un screenshot normal
-    if total_height <= VH:
+    # Captura “full page” (con stitching si hace falta)
+    total_h = driver.execute_script(
+        "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)"
+    )
+    if total_h <= VH:
         driver.save_screenshot(out_path)
         return
-    # Scrollea en tramos y pega
-    stitched = Image.new('RGB', (VW, total_height), (255,255,255))
+
+    stitched = Image.new("RGB", (VW, total_h), (255, 255, 255))
     y = 0
-    for offset in range(0, total_height, VH):
+    for offset in range(0, total_h, VH):
         driver.execute_script(f"window.scrollTo(0, {offset});")
         time.sleep(0.3)
         tmp = out_path + ".part.png"
         driver.save_screenshot(tmp)
         img = Image.open(tmp)
-        crop_h = min(VH, total_height - offset)
+        crop_h = min(VH, total_h - offset)
         stitched.paste(img.crop((0, VH - crop_h, VW, VH)), (0, y))
         y += crop_h
         img.close()
@@ -112,45 +134,47 @@ def fullpage_screenshot(driver, out_path):
     stitched.save(out_path)
 
 def element_screenshot(driver, selector, out_path):
-    WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
     el = driver.find_element(By.CSS_SELECTOR, selector)
     el.screenshot(out_path)
 
+# =======================
+# Main
+# =======================
 def main():
+    if not USER or not PASS:
+        print("[ERR] Falta GROWATT_USER o GROWATT_PASS en .env/entorno", file=sys.stderr)
+        sys.exit(1)
+
+    ensure_dir(OUT)
+
     driver = build_driver()
     try:
+        # Intentar con cookies primero; si redirige a login, hacemos login
         driver.get(DASHBOARD_URL)
-        load_cookies(driver, DASHBOARD_URL)
-        time.sleep(2)
+        load_cookies(driver)
+        time.sleep(1.5)
+
         if is_login_page(driver):
             do_login(driver)
 
-        # Espera a que carguen números/gráficos
-        time.sleep(3)
+        # Dar tiempo a que pinte el dashboard
+        time.sleep(3.0)
 
+        # Screenshot (full page o por selector)
         if SEL:
             element_screenshot(driver, SEL, OUT)
         else:
             fullpage_screenshot(driver, OUT)
 
-        print(f"[OK] Guardado {OUT}")
+        print(f"[OK] Snapshot guardado en: {OUT}")
     except Exception as e:
-        print("[ERR]", e)
+        print("[ERR] Message:", e, file=sys.stderr)
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
-
-
-from selenium.webdriver.chrome.service import Service
-
-def build_driver():
-    opts = Options()
-    opts.add_argument("--headless")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument(f"--window-size={VW},{VH}")
-    # Ruta típica del paquete chromium-chromedriver en Ubuntu
-    service = Service("/usr/lib/chromium-browser/chromedriver")
-    return webdriver.Chrome(service=service, options=opts)
