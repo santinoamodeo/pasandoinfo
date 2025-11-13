@@ -10,8 +10,9 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
-# >>> Chromium (APT)
+# Chromium (APT)
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 
@@ -24,11 +25,12 @@ if not load_dotenv(ENV_PATH):
 
 USER = os.getenv("GROWATT_USER", "")
 PASS = os.getenv("GROWATT_PASS", "")
-DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://server.growatt.com/newPortal/#/index")
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://server.growatt.com/index")
 SEL = (os.getenv("DASHBOARD_SELECTOR") or "").strip()   # vacío => full page
 OUT = os.getenv("OUTPUT_PATH", "/var/www/growatt/latest.png")
 VW = int(os.getenv("VIEWPORT_W", "1920"))
 VH = int(os.getenv("VIEWPORT_H", "1080"))
+EXTRA_WAIT = int(os.getenv("EXTRA_WAIT", "5"))
 
 COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.pkl")
 
@@ -48,7 +50,6 @@ def build_driver():
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument(f"--window-size={VW},{VH}")
-
     service = Service("/usr/lib/chromium-browser/chromedriver")
     return webdriver.Chrome(service=service, options=opts)
 
@@ -81,33 +82,73 @@ def save_cookies(driver):
         pass
 
 def is_login_page(driver):
-    # Detecta login por IDs que viste (#val_loginAccount / #val_loginPwd)
+    # Detecta login por IDs reales del formulario
     try:
-        driver.find_element(By.CSS_SELECTOR, "#val_loginAccount, #val_loginPwd")
+        driver.find_element(By.CSS_SELECTOR, "#val_loginAccount")
+        driver.find_element(By.CSS_SELECTOR, "#val_loginPwd")
         return True
     except Exception:
         return "login" in (driver.current_url or "").lower()
 
 def do_login(driver):
-    # Ir directo al login “clásico” y llenar los campos por ID
+    # Ir directo a /login
     driver.get("https://server.growatt.com/login")
     wait = WebDriverWait(driver, 30)
 
+    # Campos reales
     user = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#val_loginAccount")))
     pwd  = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#val_loginPwd")))
 
     user.clear(); user.send_keys(USER)
     pwd.clear();  pwd.send_keys(PASS)
 
-    # Enviar el formulario: ENTER en el campo contraseña
-    pwd.send_keys(Keys.ENTER)
+    # Click al botón "Login" (clases observadas: hasColorBtn loginB)
+    try:
+        btn = wait.until(EC.element_to_be_clickable(
+            (By.CSS_SELECTOR, "button.hasColorBtn.loginB, .loginBtn button.hasColorBtn.loginB")
+        ))
+        btn.click()
+    except Exception:
+        # fallback: ENTER
+        pwd.send_keys(Keys.ENTER)
 
-    # Algunas SPA no navegan; forzamos ir al dashboard y esperamos
-    time.sleep(2.5)
+    # Esperar a que deje el login
+    wait.until(lambda d: "/login" not in (d.current_url or ""))
+
+    # Forzar la URL final correcta y darle tiempo a renderizar
     driver.get(DASHBOARD_URL)
-    time.sleep(2.0)
+    WebDriverWait(driver, 30).until(lambda d: "/index" in (d.current_url or ""))
+    time.sleep(1.5)
 
     save_cookies(driver)
+
+def _wait_invisibility_of_any(driver, selectors, timeout=30):
+    """Espera a que cualquiera de los posibles 'loaders' desaparezca."""
+    for by, sel in selectors:
+        try:
+            WebDriverWait(driver, timeout).until(
+                EC.invisibility_of_element_located((by, sel))
+            )
+            return True
+        except TimeoutException:
+            pass
+    return False
+
+def wait_dashboard_ready(driver, timeout=35):
+    """
+    Intenta detectar que el dashboard dejó de estar 'Loading'.
+    Ajustá/añadí selectores si ves otros spinners.
+    """
+    loader_candidates = [
+        (By.XPATH, "//*[contains(., 'Loading')]"),
+        (By.CSS_SELECTOR, ".el-loading-mask"),
+        (By.CSS_SELECTOR, ".el-loading-spinner"),
+        (By.CSS_SELECTOR, ".loading"),
+        (By.CSS_SELECTOR, ".is-loading"),
+        (By.CSS_SELECTOR, ".layui-layer-loading"),
+    ]
+    time.sleep(1.5)  # breve espera para que aparezca el loader si va a aparecer
+    _wait_invisibility_of_any(driver, loader_candidates, timeout=timeout)
 
 def fullpage_screenshot(driver, out_path):
     # Captura “full page” (con stitching si hace falta)
@@ -153,13 +194,17 @@ def main():
         # Intentar con cookies primero; si redirige a login, hacemos login
         driver.get(DASHBOARD_URL)
         load_cookies(driver)
-        time.sleep(1.5)
+        time.sleep(1.0)
 
         if is_login_page(driver):
             do_login(driver)
 
-        # Dar tiempo a que pinte el dashboard
-        time.sleep(3.0)
+        # Esperar a que pinte el dashboard y desaparezcan loaders
+        wait_dashboard_ready(driver, timeout=40)
+
+        # Espera extra configurable
+        if EXTRA_WAIT > 0:
+            time.sleep(EXTRA_WAIT)
 
         # Screenshot (full page o por selector)
         if SEL:
