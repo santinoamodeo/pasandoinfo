@@ -141,3 +141,16 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+from selenium.webdriver.chrome.service import Service
+
+def build_driver():
+    opts = Options()
+    opts.add_argument("--headless")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument(f"--window-size={VW},{VH}")
+    # Ruta típica del paquete chromium-chromedriver en Ubuntu
+    service = Service("/usr/lib/chromium-browser/chromedriver")
+    return webdriver.Chrome(service=service, options=opts)
