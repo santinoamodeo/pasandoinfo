@@ -1,14 +1,1 @@
-sudo tee /etc/nginx/snippets/growatt.conf >/dev/null <<'NGX'
-location /growatt/ {
-    alias /var/www/growatt/;
-    autoindex off;
-    add_header Cache-Control "no-store";
-}
-NGX
-
-
-# Inserta la línea 'include ...' dentro del bloque server { ... } del default
-sudo sed -i '/server {/a \    include /etc/nginx/snippets/growatt.conf;' /etc/nginx/sites-available/default
-
-# Valida y recarga
-sudo nginx -t && sudo systemctl reload nginx
+*/5 * * * * cd /opt/growatt-snap/py && /opt/growatt-snap/py/venv/bin/python /opt/growatt-snap/py/snapshot.py >> /opt/growatt-snap/snap.log 2>&1
