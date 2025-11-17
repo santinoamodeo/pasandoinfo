@@ -1,7 +1,2 @@
-sudo tee /etc/nginx/snippets/growatt.conf >/dev/null <<'NGX'
-location /growatt/ {
-    alias /var/www/growatt/;
-    autoindex off;
-    add_header Cache-Control "no-store";
-}
-NGX
+# Inserta la línea de include dentro del bloque server { ... } del sitio por defecto
+sudo sed -i '/server {/a \    include /etc/nginx/snippets/growatt.conf;' /etc/nginx/sites-available/default
