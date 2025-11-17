@@ -1,1 +1,4 @@
 */5 * * * * cd /opt/growatt-snap/py && /opt/growatt-snap/py/venv/bin/python /opt/growatt-snap/py/snapshot.py >> /opt/growatt-snap/snap.log 2>&1
+
+
+cd /opt/growatt-snap/py && /opt/growatt-snap/py/venv/bin/python /opt/growatt-snap/py/snapshot.py
