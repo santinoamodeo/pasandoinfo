@@ -1,2 +1,29 @@
-# Inserta la línea de include dentro del bloque server { ... } del sitio por defecto
-sudo sed -i '/server {/a \    include /etc/nginx/snippets/growatt.conf;' /etc/nginx/sites-available/default
+# 1) Backup del sitio actual
+sudo cp /etc/nginx/sites-available/default /etc/nginx/sites-available/default.bak
+
+# 2) (Re)crear el snippet correcto (por si quedó bien, esto no molesta)
+sudo tee /etc/nginx/snippets/growatt.conf >/dev/null <<'NGX'
+location /growatt/ {
+    alias /var/www/growatt/;
+    autoindex off;
+    add_header Cache-Control "no-store";
+}
+NGX
+
+# 3) Sobrescribir el archivo /etc/nginx/sites-available/default con un server limpio
+sudo tee /etc/nginx/sites-available/default >/dev/null <<'NGX'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+
+    # (opcional) root por defecto
+    root /var/www/html;
+    index index.html index.nginx-debian.html;
+
+    # <<< acá sí, a nivel de server (no dentro de 'location') >>>
+    include /etc/nginx/snippets/growatt.conf;
+}
+NGX
+
+# 4) Validar y recargar
+sudo nginx -t && sudo systemctl reload nginx
