@@ -1,0 +1,39 @@
+<div id="growatt-wrap">
+  <img id="growatt-snap" alt="Growatt KPIs" />
+</div>
+
+<script>
+  // === CONFIGURACIÓN ===
+  const IMG_URL = "http://IP_O_DOMINIO/growatt/latest.png";  // <-- cambia esto
+  const REFRESH_MS = 300000;  // 5 minutos (igual a tu cron/timer)
+
+  function loadImage() {
+    const t = Date.now(); // cache-busting
+    const el = document.getElementById("growatt-snap");
+    el.src = IMG_URL + "?t=" + t;
+  }
+
+  // Primera carga + refresco periódico
+  loadImage();
+  setInterval(loadImage, REFRESH_MS);
+</script>
+
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%; background: #000;
+    overflow: hidden;
+  }
+  #growatt-wrap {
+    position: absolute; inset: 0;   /* ocupa todo el widget */
+    display: flex; align-items: center; justify-content: center;
+    background: #000;               /* negro para pantallas */
+  }
+  #growatt-snap {
+    max-width: 100%;
+    max-height: 100%;
+    width: 100%;                    /* llena ancho */
+    height: 100%;                   /* llena alto */
+    object-fit: contain;            /* mantiene proporción sin recorte */
+    image-rendering: auto;
+  }
+</style>
