@@ -1,7 +1,363 @@
-# 1) Backup del sitio actual
-sudo cp /etc/nginx/sites-available/default /etc/nginx/sites-available/default.bak
+0) Paquetes del sistema
 
-# 2) (Re)crear el snippet correcto (por si quedó bien, esto no molesta)
+sudo apt update
+sudo apt -y install nginx python3 python3-venv python3-pip \
+                    chromium-browser chromium-chromedriver \
+                    curl ca-certificates
+
+-----------------------------------------------------
+
+1) Estructura de carpetas
+
+sudo mkdir -p /opt/growatt-snap/py
+sudo mkdir -p /var/www/growatt
+sudo chown -R $USER:$USER /opt/growatt-snap
+sudo chown -R $USER:$USER /var/www/growatt
+
+
+-----------------------------------------------------
+
+2) Variables (.env)
+tee /opt/growatt-snap/.env >/dev/null <<'ENV'
+GROWATT_USER=tu_usuario
+GROWATT_PASS=tu_password
+DASHBOARD_URL=https://server.growatt.com/index
+# Vacío = full page; si querés recortar por CSS, ponelo acá (ej: #app .kpi-wrap)
+DASHBOARD_SELECTOR=
+OUTPUT_PATH=/var/www/growatt/latest.png
+VIEWPORT_W=1920
+VIEWPORT_H=1080
+# Espera extra en segundos para asegurar que el dashboard pinte números
+EXTRA_WAIT=8
+ENV
+chmod 600 /opt/growatt-snap/.env
+
+-----------------------------------------------------
+
+3) App Python (requirements + script)
+3.1 requirements.txt
+----
+
+tee /opt/growatt-snap/py/requirements.txt >/dev/null <<'REQ'
+selenium
+python-dotenv
+Pillow
+REQ
+
+----
+
+3.2 snapshot.py
+
+tee /opt/growatt-snap/py/snapshot.py >/dev/null <<'PY'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os, time, pickle, sys
+from dotenv import load_dotenv
+from PIL import Image
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+
+# Chromium (APT)
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+
+# =======================
+# Cargar variables .env
+# =======================
+ENV_PATH = os.path.join(os.path.dirname(__file__), "..", ".env")
+if not load_dotenv(ENV_PATH):
+    print("Aviso: no se pudo cargar .env; usaré variables de entorno si existen.", file=sys.stderr)
+
+USER = os.getenv("GROWATT_USER", "")
+PASS = os.getenv("GROWATT_PASS", "")
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://server.growatt.com/index")
+SEL = (os.getenv("DASHBOARD_SELECTOR") or "").strip()   # vacío => full page
+OUT = os.getenv("OUTPUT_PATH", "/var/www/growatt/latest.png")
+VW = int(os.getenv("VIEWPORT_W", "1920"))
+VH = int(os.getenv("VIEWPORT_H", "1080"))
+EXTRA_WAIT = int(os.getenv("EXTRA_WAIT", "8"))
+KPI_TEXTS = [s.strip() for s in (os.getenv("KPI_TEXTS","").split(",")) if s.strip()]
+
+COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.pkl")
+
+# =======================
+# Driver Chromium (APT)
+# =======================
+def build_driver():
+    """
+    Usa el binario de Chromium y ChromeDriver instalados por APT:
+      - /usr/bin/chromium-browser
+      - /usr/lib/chromium-browser/chromedriver
+    """
+    opts = Options()
+    opts.binary_location = "/usr/bin/chromium-browser"     # binario APT, NO el snap
+    opts.add_argument("--headless")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument(f"--window-size={VW},{VH}")
+    service = Service("/usr/lib/chromium-browser/chromedriver")
+    return webdriver.Chrome(service=service, options=opts)
+
+# =======================
+# Utilidades de cookies/FS
+# =======================
+def ensure_dir(file_path: str):
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+def load_cookies(driver, url_base="https://server.growatt.com/"):
+    if os.path.exists(COOKIES_PATH):
+        driver.get(url_base)
+        try:
+            with open(COOKIES_PATH, "rb") as f:
+                cookies = pickle.load(f)
+            for c in cookies:
+                c.pop("sameSite", None)  # evita errores en algunas versiones
+                try:
+                    driver.add_cookie(c)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+def save_cookies(driver):
+    try:
+        with open(COOKIES_PATH, "wb") as f:
+            pickle.dump(driver.get_cookies(), f)
+    except Exception:
+        pass
+
+# =======================
+# Detección/login
+# =======================
+def is_login_page(driver):
+    try:
+        driver.find_element(By.CSS_SELECTOR, "#val_loginAccount")
+        driver.find_element(By.CSS_SELECTOR, "#val_loginPwd")
+        return True
+    except Exception:
+        return "login" in (driver.current_url or "").lower()
+
+def do_login(driver):
+    driver.get("https://server.growatt.com/login")
+    wait = WebDriverWait(driver, 30)
+    user = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#val_loginAccount")))
+    pwd  = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#val_loginPwd")))
+    user.clear(); user.send_keys(USER)
+    pwd.clear();  pwd.send_keys(PASS)
+    try:
+        btn = wait.until(EC.element_to_be_clickable(
+            (By.CSS_SELECTOR, "button.hasColorBtn.loginB, .loginBtn button.hasColorBtn.loginB")
+        ))
+        btn.click()
+    except Exception:
+        pwd.send_keys(Keys.ENTER)
+    wait.until(lambda d: "/login" not in (d.current_url or ""))
+    if "/index" not in (driver.current_url or ""):
+        driver.get(DASHBOARD_URL)
+    save_cookies(driver)
+
+# =======================
+# Esperas robustas de SPA
+# =======================
+def wait_dom_ready(driver, timeout=30):
+    WebDriverWait(driver, timeout).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+
+def click_dashboard_tab(driver):
+    candidates = [
+        (By.XPATH, "//*[normalize-space(text())='Dashboard']"),
+        (By.CSS_SELECTOR, ".dashboard, .menu-dashboard, .home-dashboard")
+    ]
+    for by, sel in candidates:
+        try:
+            el = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((by, sel)))
+            el.click()
+            time.sleep(0.5)
+            return True
+        except Exception:
+            continue
+    return False
+
+def wait_loader_gone_js(driver, timeout=60):
+    end = time.time() + timeout
+    js = """
+      const sel = ['.el-loading-mask','.el-loading-spinner','.layui-layer-loading','.loading','.is-loading'];
+      function anyVisible() {
+        for (const s of sel) {
+          const el = document.querySelector(s);
+          if (!el) continue;
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+          const visible = style.visibility !== 'hidden' &&
+                          style.display !== 'none' &&
+                          rect.width > 1 && rect.height > 1 && rect.bottom > 0 && rect.right > 0;
+          if (visible) return true;
+        }
+        const txt = document.body.innerText || '';
+        if (txt.includes('Loading')) return true;
+        return false;
+      }
+      return anyVisible();
+    """
+    while time.time() < end:
+        try:
+            if not driver.execute_script(js):
+                return True
+        except Exception:
+            pass
+        time.sleep(1.0)
+    return False
+
+def wait_dashboard_ready(driver, hard_timeout=60, extra_wait=5):
+    wait_dom_ready(driver, timeout=min(30, hard_timeout))
+    click_dashboard_tab(driver)
+    ok = wait_loader_gone_js(driver, timeout=hard_timeout)
+    if not ok:
+        driver.execute_script("location.reload()")
+        wait_dom_ready(driver, timeout=min(30, hard_timeout))
+        click_dashboard_tab(driver)
+        wait_loader_gone_js(driver, timeout=hard_timeout)
+    if extra_wait > 0:
+        time.sleep(extra_wait)
+
+# =======================
+# Recortes / screenshots
+# =======================
+def fullpage_screenshot(driver, out_path):
+    total_h = driver.execute_script(
+        "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)"
+    )
+    if total_h <= VH:
+        driver.save_screenshot(out_path)
+        return
+    stitched = Image.new("RGB", (VW, total_h), (255, 255, 255))
+    y = 0
+    for offset in range(0, total_h, VH):
+        driver.execute_script(f"window.scrollTo(0, {offset});")
+        time.sleep(0.3)
+        tmp = out_path + ".part.png"
+        driver.save_screenshot(tmp)
+        img = Image.open(tmp)
+        crop_h = min(VH, total_h - offset)
+        stitched.paste(img.crop((0, VH - crop_h, VW, VH)), (0, y))
+        y += crop_h
+        img.close()
+        os.remove(tmp)
+    stitched.save(out_path)
+
+def element_screenshot(driver, selector, out_path):
+    WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
+    el = driver.find_element(By.CSS_SELECTOR, selector)
+    el.screenshot(out_path)
+
+# ---- Recorte por textos ancla (opcional) ----
+def _find_nodes_by_texts(driver, texts):
+    nodes = []
+    for t in texts:
+        xp = f"//*[contains(normalize-space(.), '{t}')]"
+        try:
+            el = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, xp))
+            )
+            nodes.append(el)
+        except Exception:
+            pass
+    return nodes
+
+def screenshot_kpi_block_by_texts(driver, out_path, texts):
+    nodes = _find_nodes_by_texts(driver, texts)
+    if not nodes:
+        raise Exception("No se encontraron textos ancla; revisa KPI_TEXTS en .env")
+    tmp_full = out_path + ".tmp_full.png"
+    driver.save_screenshot(tmp_full)
+    rects = []
+    for n in nodes:
+        r = driver.execute_script("""
+          const r = arguments[0].getBoundingClientRect();
+          return {x: Math.max(0, Math.floor(r.x)), y: Math.max(0, Math.floor(r.y)),
+                  w: Math.floor(r.width), h: Math.floor(r.height)};
+        """, n)
+        rects.append(r)
+    min_x = min(r['x'] for r in rects); min_y = min(r['y'] for r in rects)
+    max_x = max(r['x']+r['w'] for r in rects); max_y = max(r['y']+r['h'] for r in rects)
+    im = Image.open(tmp_full)
+    crop = im.crop((min_x, min_y, max_x, max_y))
+    crop.save(out_path)
+    im.close()
+    os.remove(tmp_full)
+
+# =======================
+# Main
+# =======================
+def main():
+    if not USER or not PASS:
+        print("[ERR] Falta GROWATT_USER o GROWATT_PASS en .env/entorno", file=sys.stderr)
+        sys.exit(1)
+
+    ensure_dir(OUT)
+    driver = build_driver()
+    try:
+        driver.get(DASHBOARD_URL)
+        load_cookies(driver)
+        time.sleep(1.0)
+        if is_login_page(driver):
+            do_login(driver)
+        wait_dashboard_ready(driver, hard_timeout=60, extra_wait=EXTRA_WAIT)
+
+        # Orden de captura: selector CSS > KPI_TEXTS > full-page
+        if SEL:
+            element_screenshot(driver, SEL, OUT)
+        elif KPI_TEXTS:
+            screenshot_kpi_block_by_texts(driver, OUT, KPI_TEXTS)
+        else:
+            fullpage_screenshot(driver, OUT)
+
+        print(f"[OK] Snapshot guardado en: {OUT}")
+    except Exception as e:
+        print("[ERR] Message:", e, file=sys.stderr)
+    finally:
+        try: driver.quit()
+        except Exception: pass
+
+if __name__ == "__main__":
+    main()
+PY
+chmod +x /opt/growatt-snap/py/snapshot.py
+
+
+----------------------------------------
+
+4) Entorno virtual + dependencias
+
+cd /opt/growatt-snap/py
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+----------------------------------------
+
+5) Primera ejecución y verificación
+
+cd /opt/growatt-snap/py
+source venv/bin/activate
+python3 snapshot.py
+ls -lh /var/www/growatt/latest.png
+
+
+---------------------------------------
+
+6) Publicación por Nginx
+
+6.1 Snippet /growatt/
+
 sudo tee /etc/nginx/snippets/growatt.conf >/dev/null <<'NGX'
 location /growatt/ {
     alias /var/www/growatt/;
@@ -10,20 +366,68 @@ location /growatt/ {
 }
 NGX
 
-# 3) Sobrescribir el archivo /etc/nginx/sites-available/default con un server limpio
+
+----
+
+6.2 Incluirlo en el “default”
+
 sudo tee /etc/nginx/sites-available/default >/dev/null <<'NGX'
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
 
-    # (opcional) root por defecto
     root /var/www/html;
     index index.html index.nginx-debian.html;
 
-    # <<< acá sí, a nivel de server (no dentro de 'location') >>>
     include /etc/nginx/snippets/growatt.conf;
 }
 NGX
 
-# 4) Validar y recargar
 sudo nginx -t && sudo systemctl reload nginx
+
+---------------------
+
+6.3 (Firewall UFW si aplica)
+
+sudo ufw allow 'Nginx Full' || sudo ufw allow 80/tcp
+
+----------
+
+6.4 Probar
+
+curl -I http://127.0.0.1/growatt/latest.png
+
+----------
+
+
+7) Programar con cron (cada 5 minutos)
+
+crontab -e
+
+*/5 * * * * cd /opt/growatt-snap/py && /opt/growatt-snap/py/venv/bin/python /opt/growatt-snap/py/snapshot.py >> /opt/growatt-snap/snap.log 2>&1
+
+
+
+
+---------------------
+
+xibo incrustado
+
+<div id="growatt-wrap">
+  <img id="growatt-snap" alt="Growatt KPIs" />
+</div>
+<script>
+  const IMG_URL = "http://IP_O_DOMINIO/growatt/latest.png";
+  const REFRESH_MS = 300000; // 5 min
+  function loadImage(){
+    const t = Date.now();
+    document.getElementById('growatt-snap').src = IMG_URL + "?t=" + t;
+  }
+  loadImage();
+  setInterval(loadImage, REFRESH_MS);
+</script>
+<style>
+  html,body{margin:0;padding:0;height:100%;width:100%;background:#000;overflow:hidden;}
+  #growatt-wrap{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#000;}
+  #growatt-snap{max-width:100%;max-height:100%;width:100%;height:100%;object-fit:contain;}
+</style>
