@@ -1,1 +1,0 @@
-cd /opt/growatt-snap/py && /opt/growatt-snap/py/venv/bin/python /opt/growatt-snap/py/snapshot.py
